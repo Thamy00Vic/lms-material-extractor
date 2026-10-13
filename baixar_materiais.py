@@ -4,16 +4,19 @@ from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
 LOGIN_URL = "https://unicorp.loja.srv.br/sga_alunos_login/"
-CPF_LOGIN = "836.262.820-07"
-SENHA_LOGIN = "01012005"
+CPF_LOGIN = "SEU_CPF_AQUI"
+SENHA_LOGIN = "SUA_SENHA_AQUI"
 
+def registrar_aviso_plataforma(curso, disciplina, unidade, motivo):
+  """Registra ocorrências e bloqueios em um diário de bordo para o Inspetor ler."""
+  with open("log_plataforma.txt", "a", encoding="utf-8") as f:
+    f.write(f"{curso}|{disciplina}|{unidade}|{motivo}\n")
 
 def limpar_nome(nome):
   if not nome:
     return "Sem_Nome"
   nome_limpo = re.sub(r'[\\/*?:"<>|]', "", nome)
   return re.sub(r"\s+", " ", nome_limpo).strip()
-
 
 def material_ja_existe(pasta_destino, nome_base):
   """Verifica se o PDF ou a imagem já foi baixada."""
@@ -22,7 +25,6 @@ def material_ja_existe(pasta_destino, nome_base):
   return (os.path.exists(caminho_pdf) and os.path.getsize(caminho_pdf) > 1000) or (
       os.path.exists(caminho_png) and os.path.getsize(caminho_png) > 1000
   )
-
 
 with sync_playwright() as p:
   browser = p.chromium.launch(headless=False)
@@ -83,7 +85,7 @@ with sync_playwright() as p:
   print(f"\nTotal de cursos identificados: {len(lista_cursos_urls)}")
 
   # =========================================================================
-  # PROCESSAMENTO DE CADA CURSO
+  # PROCESSAMENTO DE CADA CURSO (ORDEM NORMAL)
   # =========================================================================
   for idx_c, link_curso in enumerate(lista_cursos_urls):
     print(f"\n=================================================================")
@@ -98,7 +100,6 @@ with sync_playwright() as p:
 
     url_curso = urljoin("https://unicorp.loja.srv.br/sga_alunos/", link_curso)
 
-    # Tenta abrir o curso, com tratamento de reconexão se o portal abortar (ERR_ABORTED)
     try:
       page.goto(url_curso, wait_until="domcontentloaded", timeout=60000)
       page.wait_for_timeout(3500)
@@ -160,12 +161,18 @@ with sync_playwright() as p:
       except Exception:
         continue
 
+      # === VERIFICAÇÃO DE DISCIPLINA VAZIA/TRANCADA ===
+      if not unidades_urls:
+          print(f"       ⚠️ Nenhuma unidade liberada na disciplina {nome_disciplina}.")
+          registrar_aviso_plataforma(nome_curso, nome_disciplina, "N/A", "Disciplina sem unidades (Bloqueada ou Vazia).")
+          continue
+      # =================================================
+
       for txt_unid, href_unid in unidades_urls:
         unidade_nome = limpar_nome(txt_unid)
         pasta_destino = os.path.join("cursos", nome_curso, nome_disciplina, unidade_nome)
         os.makedirs(pasta_destino, exist_ok=True)
 
-        # Retomada Inteligente
         if material_ja_existe(pasta_destino, "Slides") and material_ja_existe(pasta_destino, "E-book"):
           print(f"   ⏩ {unidade_nome}: Já baixado, pulando...")
           continue
@@ -174,12 +181,28 @@ with sync_playwright() as p:
         print(f"   --> Acessando {unidade_nome}...")
 
         try:
-          # Alterado para "commit" para não travar se a página demorar a montar os recursos
           page.goto(url_unidade_completa, wait_until="commit", timeout=60000)
           page.wait_for_timeout(3000)
         except Exception as e:
           print(f"Erro ao abrir {unidade_nome}. O portal demorou muito a responder.")
           continue
+
+        # =============================================================
+        # VERIFICAÇÃO DE BLOQUEIO DE UNIDADE
+        # =============================================================
+        indicador_bloqueio = page.locator('text="Disponível em breve", text="Bloqueado", text="indisponível", .alert-warning, .alert-danger').first
+
+        if indicador_bloqueio.is_visible():
+          motivo_texto = indicador_bloqueio.inner_text().strip().replace("\n", " ")
+          print(f"       ⚠️ Conteúdo restrito detectado: {motivo_texto}")
+          registrar_aviso_plataforma(
+              nome_curso,
+              nome_disciplina,
+              unidade_nome,
+              f"Bloqueado pela plataforma: {motivo_texto}"
+          )
+          continue
+        # =============================================================
 
         try:
             linhas_mats = page.locator('table a[href*="teste3"]').all()
@@ -212,7 +235,6 @@ with sync_playwright() as p:
           caminho_pdf = os.path.join(pasta_destino, f"{nome_arquivo_base}.pdf")
           baixou = False
 
-          # 1. Tentativa botão visualizador
           try:
               btn_doc = page.locator('text="Clique para Visualizar/Baixar o documento"')
               if btn_doc.count() > 0:
@@ -225,7 +247,6 @@ with sync_playwright() as p:
           except Exception:
               pass
 
-          # 2. Tentativa toolbar nativo
           if not baixou:
             try:
               btn_toolbar = page.locator('button#download, #download, button[title*="Download"]')
@@ -239,7 +260,6 @@ with sync_playwright() as p:
             except Exception:
               pass
 
-          # 3. Tentativa rede
           if not baixou and ultimo_pdf_url[0]:
             try:
               res_pdf = context.request.get(ultimo_pdf_url[0])
@@ -251,7 +271,6 @@ with sync_playwright() as p:
             except Exception:
               pass
 
-          # 4. Fallback print da tela
           if not baixou:
             caminho_img = os.path.join(pasta_destino, f"{nome_arquivo_base}.png")
             try:
